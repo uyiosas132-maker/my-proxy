@@ -79,6 +79,17 @@ if((f.getAttribute("method")||"get").toLowerCase()==="get"){e.preventDefault();c
 if(e.submitter&&e.submitter.name)fd.append(e.submitter.name,e.submitter.value);
 const q=new URLSearchParams();fd.forEach((v,k)=>{if(typeof v==="string")q.append(k,v)});a.search=q.toString();
 location.href=P+encodeURIComponent(a.href)}else{f.setAttribute("action",P+encodeURIComponent(a.href))}}catch{}},false);
+const dec=x=>{try{return decodeURIComponent(x)}catch{return x}};
+const NL=String.fromCharCode(10),L=[];let B;
+const show=m=>{try{L.push(m);if(L.length>6)L.shift();
+if(!B){B=document.createElement("div");B.style.cssText="position:fixed;left:6px;bottom:6px;z-index:2147483647;max-width:75vw;background:rgba(0,0,0,.88);color:#fff;font:11px/1.4 monospace;padding:6px 8px;border-radius:6px;white-space:pre-wrap;word-break:break-all;cursor:pointer";B.title="click to hide";B.onclick=()=>B.remove()}
+B.textContent="[proxy] failed to load:"+NL+L.join(NL);(document.body||document.documentElement).appendChild(B);
+clearTimeout(B._t);B._t=setTimeout(()=>B.remove(),30000)}catch{}};
+addEventListener("error",e=>{const t=e.target;if(!t||!t.tagName||!/^(IMG|SCRIPT|LINK|VIDEO|AUDIO|SOURCE)$/.test(t.tagName))return;
+const u=t.currentSrc||t.src||t.href||"";if(!u)return;
+if(!u.startsWith(location.origin+P)&&!u.startsWith(P)){show("NOT PROXIED "+u.slice(0,160));return}
+const name=dec(u.split("url=")[1]||u).slice(0,160);
+fetch(u).then(r=>r.blob().then(b=>show(r.status+" "+(r.headers.get("content-type")||"?")+" "+b.size+"B "+name))).catch(()=>show("fetch error "+name))},true);
 })();</script>`;
 }
 
@@ -100,9 +111,10 @@ function rewriteMarkup(html: string, base: string): string {
     .replace(/\s(integrity|nonce|crossorigin)\s*=\s*("[^"]*"|'[^']*')/gi, "")
     // Responsive images: srcset and data-srcset hold several URLs separated by commas.
     .replace(
-      /(\s(?:srcset|data-srcset)\s*=\s*)(["'])(.*?)\2/gis,
+      /(\s(?:srcset|data-srcset|imagesrcset)\s*=\s*)(["'])(.*?)\2/gis,
       (_m, attr, quote, val) => {
         const rewritten = val
+          .replace(/&amp;/g, "&")
           .split(",")
           .map((part: string) => {
             const [u, ...rest] = part.trim().split(/\s+/);
