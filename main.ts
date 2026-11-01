@@ -15,13 +15,19 @@ const STRIP = [
   "content-encoding",
   "content-length",
   "set-cookie",
+  "cross-origin-embedder-policy",
+  "cross-origin-opener-policy",
+  "cross-origin-resource-policy",
 ];
 
-const proxify = (url: string) => "/proxy?url=" + encodeURIComponent(url);
+const PREFIX = "/proxy?url=";
+const SKIP = /^(#|data:|javascript:|mailto:|tel:|blob:|about:)/i;
+
+const proxify = (url: string) => PREFIX + encodeURIComponent(url);
 
 function resolve(value: string, base: string): string {
   const v = value.trim();
-  if (!v || /^(#|data:|javascript:|mailto:|tel:|blob:|about:)/i.test(v)) return value;
+  if (!v || SKIP.test(v) || v.startsWith(PREFIX)) return value;
   try {
     return proxify(new URL(v, base).href);
   } catch {
@@ -29,22 +35,71 @@ function resolve(value: string, base: string): string {
   }
 }
 
-function rewriteHtml(html: string, base: string): string {
-  return html
-    // Drop CSP set through <meta> tags.
-    .replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, "")
-    // Route links, images, scripts, forms and media back through the proxy.
+function rewriteCss(css: string, base: string): string {
+  return css
     .replace(
-      /(\s(?:href|src|action|poster)\s*=\s*)(["'])(.*?)\2/gis,
-      (_m, attr, quote, val) => `${attr}${quote}${resolve(val, base)}${quote}`,
+      /url\(\s*(["']?)(.*?)\1\s*\)/gi,
+      (_m, quote, val) => `url(${quote}${resolve(val, base)}${quote})`,
+    )
+    .replace(
+      /@import\s+(["'])(.*?)\1/gi,
+      (_m, quote, val) => `@import ${quote}${resolve(val, base)}${quote}`,
     );
 }
 
-function rewriteCss(css: string, base: string): string {
-  return css.replace(
-    /url\(\s*(["']?)(.*?)\1\s*\)/gi,
-    (_m, quote, val) => `url(${quote}${resolve(val, base)}${quote})`,
-  );
+// Runtime patch so images, fetch and XHR created by page scripts also go through the proxy.
+function runtimePatch(base: string): string {
+  return `<script>(()=>{const R=${JSON.stringify(base)},P=${JSON.stringify(PREFIX)};
+const w=u=>{try{u=String(u);if(!u||/^(data:|blob:|javascript:|#|about:)/i.test(u)||u.startsWith(P))return u;return P+encodeURIComponent(new URL(u,R).href)}catch{return u}};
+const of=window.fetch;window.fetch=(i,o)=>of(typeof i==="string"?w(i):i,o);
+const ox=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,...a){return ox.call(this,m,w(u),...a)};
+const sa=Element.prototype.setAttribute;Element.prototype.setAttribute=function(n,v){if(/^(src|href|poster)$/i.test(n))v=w(v);return sa.call(this,n,v)};
+for(const [C,p] of [[HTMLImageElement,"src"],[HTMLScriptElement,"src"],[HTMLSourceElement,"src"],[HTMLLinkElement,"href"]]){
+const d=Object.getOwnPropertyDescriptor(C.prototype,p);if(d&&d.set)Object.defineProperty(C.prototype,p,{get:d.get,set(v){d.set.call(this,w(v))}})}
+})();</script>`;
+}
+
+function rewriteHtml(html: string, base: string): string {
+  html = html
+    // Drop CSP set through <meta> tags.
+    .replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, "")
+    // Integrity/nonce/crossorigin attributes break once URLs are rewritten.
+    .replace(/\s(integrity|nonce|crossorigin)\s*=\s*("[^"]*"|'[^']*')/gi, "")
+    // Route links, images, scripts, forms, media and lazy-load attributes back through the proxy.
+    .replace(
+      /(\s(?:href|src|action|poster|data-src|data-original|data-lazy-src)\s*=\s*)(["'])(.*?)\2/gis,
+      (_m, attr, quote, val) =>
+        `${attr}${quote}${resolve(val.replace(/&amp;/g, "&"), base).replace(/"/g, "&quot;")}${quote}`,
+    )
+    // Responsive images: srcset and data-srcset hold several URLs separated by commas.
+    .replace(
+      /(\s(?:srcset|data-srcset)\s*=\s*)(["'])(.*?)\2/gis,
+      (_m, attr, quote, val) => {
+        const rewritten = val
+          .split(",")
+          .map((part: string) => {
+            const [u, ...rest] = part.trim().split(/\s+/);
+            return [resolve(u, base), ...rest].join(" ");
+          })
+          .join(", ");
+        return `${attr}${quote}${rewritten.replace(/"/g, "&quot;")}${quote}`;
+      },
+    )
+    // Inline style="" attributes with background images.
+    .replace(
+      /(\sstyle\s*=\s*)"([^"]*)"/gi,
+      (_m, attr, css) => `${attr}"${rewriteCss(css, base).replace(/"/g, "&quot;")}"`,
+    )
+    // <style> blocks.
+    .replace(
+      /<style([^>]*)>([\s\S]*?)<\/style>/gi,
+      (_m, attrs, css) => `<style${attrs}>${rewriteCss(css, base)}</style>`,
+    );
+
+  const inject = runtimePatch(base);
+  return /<head[^>]*>/i.test(html)
+    ? html.replace(/<head[^>]*>/i, (m) => m + inject)
+    : inject + html;
 }
 
 Deno.serve(async (req) => {
@@ -72,6 +127,8 @@ Deno.serve(async (req) => {
     const v = req.headers.get(h);
     if (v) headers.set(h, v);
   }
+  // Many image hosts reject requests without a same-site referer (hotlink protection).
+  headers.set("referer", t.origin + "/");
 
   let upstream: Response;
   try {
@@ -87,6 +144,7 @@ Deno.serve(async (req) => {
 
   const out = new Headers(upstream.headers);
   for (const h of STRIP) out.delete(h);
+  out.set("access-control-allow-origin", "*");
 
   // Keep redirects inside the proxy.
   const loc = upstream.headers.get("location");
@@ -98,6 +156,7 @@ Deno.serve(async (req) => {
 
   const type = upstream.headers.get("content-type") ?? "";
   if (type.includes("text/html")) {
+    out.set("content-type", "text/html; charset=utf-8");
     return new Response(rewriteHtml(await upstream.text(), t.href), {
       status: upstream.status,
       headers: out,
@@ -109,5 +168,6 @@ Deno.serve(async (req) => {
       headers: out,
     });
   }
+  // Images, fonts, video, JS and JSON stream through untouched.
   return new Response(upstream.body, { status: upstream.status, headers: out });
 });
